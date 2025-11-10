@@ -6,13 +6,12 @@ import time
 import math
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
+import threading
 
-
-
-# Конфигурация
+# ОПТИМИЗИРОВАННАЯ КОНФИГУРАЦИЯ
 CSV_FILENAME = 'primes.csv'
-BATCH_SIZE = 10000  # Размер батча для GPU
-CPU_BATCH_SIZE = 5000  # Размер батча для CPU
+GPU_BATCH_SIZE = 500000    # 500K чисел для GPU
+CPU_BATCH_SIZE = 50000     # 50K чисел для CPU
 
 def get_last_prime_from_csv(filename):
     if not os.path.exists(filename):
@@ -48,22 +47,7 @@ def cpu_prime_worker(args):
             primes.append(n)
     return primes
 
-# Функция для выбора устройств вычисления
-def setup_opencl_devices():
-    platforms = cl.get_platforms()
-    devices = []
-    for p in platforms:
-        try:
-            devs = p.get_devices(device_type=cl.device_type.GPU)
-            for d in devs:
-                if 'AMD' in d.vendor or 'Intel' in d.vendor:
-                    devices.append((p, d))
-                    print(f"Найдено устройство: {d.vendor} - {d.name}")
-        except:
-            continue
-    return devices
-
-# OpenCL kernel код
+# Оптимизированное ядро OpenCL
 opencl_kernel_code = """
 __kernel void find_primes(__global const uint* numbers, 
                           __global uint* results,
@@ -72,70 +56,103 @@ __kernel void find_primes(__global const uint* numbers,
     if (gid >= count) return;
     
     uint n = numbers[gid];
-    uint result = 1;
     
-    if (n < 2) {
-        result = 0;
-    } else if (n == 2) {
-        result = 1;
-    } else if (n % 2 == 0) {
-        result = 0;
-    } else {
-        for (uint i = 3; i * i <= n; i += 2) {
-            if (n % i == 0) {
-                result = 0;
-                break;
-            }
+    if (n <= 1) {
+        results[gid] = 0;
+        return;
+    }
+    if (n == 2) {
+        results[gid] = 1;
+        return;
+    }
+    if (n % 2 == 0) {
+        results[gid] = 0;
+        return;
+    }
+    
+    uint sqrt_n = sqrt((float)n);
+    for (uint i = 3; i <= sqrt_n; i += 2) {
+        if (n % i == 0) {
+            results[gid] = 0;
+            return;
         }
     }
     
-    results[gid] = result;
+    results[gid] = 1;
 }
 """
 
-class PrimeCalculator:
+class OptimizedPrimeCalculator:
     def __init__(self):
         self.filename = CSV_FILENAME
         self.start_num = get_last_prime_from_csv(self.filename) + 1
-        self.opencl_devices = setup_opencl_devices()
-        self.opencl_contexts = []
-        self.opencl_queues = []
-        self.opencl_programs = []
         
-        # Инициализация OpenCL
-        for platform, device in self.opencl_devices:
+        # Инициализация ВСЕХ устройств OpenCL
+        platforms = cl.get_platforms()
+        self.contexts = []
+        self.queues = []
+        self.programs = []
+        
+        for platform in platforms:
             try:
-                ctx = cl.Context([device])
-                queue = cl.CommandQueue(ctx)
-                program = cl.Program(ctx, opencl_kernel_code).build()
-                
-                self.opencl_contexts.append(ctx)
-                self.opencl_queues.append(queue)
-                self.opencl_programs.append(program)
-                print(f"Успешно инициализировано устройство: {device.name}")
-            except Exception as e:
-                print(f"Ошибка инициализации устройства {device.name}: {e}")
+                # Пробуем использовать все GPU устройства
+                devices = platform.get_devices(device_type=cl.device_type.GPU)
+                for device in devices:
+                    try:
+                        ctx = cl.Context([device])
+                        queue = cl.CommandQueue(ctx)
+                        program = cl.Program(ctx, opencl_kernel_code).build()
+                        
+                        self.contexts.append(ctx)
+                        self.queues.append(queue)
+                        self.programs.append(program)
+                        print(f"Успешно инициализировано: {device.vendor} - {device.name}")
+                        print(f"  Макс. рабочая группа: {device.max_work_group_size}")
+                        print(f"  Выч. единицы: {device.max_compute_units}")
+                    except Exception as e:
+                        print(f"Ошибка инициализации {device.name}: {e}")
+            except:
+                continue
+        
+        if not self.contexts:
+            print("Не найдено GPU устройств, используем только CPU")
     
-    def calculate_primes_gpu(self, device_idx, start, end):
-        if device_idx >= len(self.opencl_contexts):
+    def calculate_primes_gpu_batch(self, device_idx, start, end):
+        """GPU вычисления в основном потоке"""
+        if device_idx >= len(self.contexts):
             return []
         
-        ctx = self.opencl_contexts[device_idx]
-        queue = self.opencl_queues[device_idx]
-        program = self.opencl_programs[device_idx]
+        ctx = self.contexts[device_idx]
+        queue = self.queues[device_idx]
+        program = self.programs[device_idx]
         
         numbers = np.arange(start, end + 1, dtype=np.uint32)
         total_numbers = len(numbers)
         
+        # Оптимизация: используем меньший размер рабочей группы
+        device = ctx.devices[0]
+        max_wg_size = device.max_work_group_size
+        work_group_size = min(256, max_wg_size)
+        
         numbers_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=numbers)
         results_buf = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, numbers.nbytes)
         
-        program.find_primes(queue, (total_numbers,), None, numbers_buf, results_buf, np.uint32(total_numbers))
+        # Запускаем с оптимальным размером рабочей группы
+        global_size = ((total_numbers + work_group_size - 1) // work_group_size) * work_group_size
+        
+        start_time = time.time()
+        program.find_primes(queue, (global_size,), (work_group_size,), 
+                          numbers_buf, results_buf, np.uint32(total_numbers))
         
         results = np.empty(total_numbers, dtype=np.uint32)
         cl.enqueue_copy(queue, results, results_buf).wait()
+        gpu_time = time.time() - start_time
         
         primes = numbers[results == 1]
+        
+        print(f"GPU {device_idx}: {len(primes)} primes from {total_numbers} numbers in {gpu_time:.3f}s "
+              f"({total_numbers/gpu_time:.0f} numbers/sec)")
+        
         return primes.tolist()
     
     def calculate_primes_cpu_parallel(self, start, end):
@@ -149,12 +166,18 @@ class PrimeCalculator:
             ranges.append((current, chunk_end))
             current = chunk_end + 1
         
+        start_time = time.time()
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             results = list(executor.map(cpu_prime_worker, ranges))
         
         primes = []
         for result in results:
             primes.extend(result)
+        
+        cpu_time = time.time() - start_time
+        total_numbers = end - start + 1
+        print(f"CPU: {len(primes)} primes from {total_numbers} numbers in {cpu_time:.3f}s "
+              f"({total_numbers/cpu_time:.0f} numbers/sec)")
         
         return primes
     
@@ -166,10 +189,12 @@ class PrimeCalculator:
             for prime in primes:
                 writer.writerow([prime])
     
-    def run_distributed_calculation(self):
+    def run_optimized_calculation(self):
         print(f"Начинаем вычисления с числа: {self.start_num}")
-        print(f"Доступно OpenCL устройств: {len(self.opencl_contexts)}")
+        print(f"Доступно OpenCL устройств: {len(self.contexts)}")
         print(f"Доступно CPU ядер: {mp.cpu_count()}")
+        print(f"Размер GPU батча: {GPU_BATCH_SIZE}")
+        print(f"Размер CPU батча: {CPU_BATCH_SIZE}")
         
         n = self.start_num
         program_start_time = time.time()
@@ -178,28 +203,37 @@ class PrimeCalculator:
             batch_start_time = time.time()
             all_primes = []
             
-            # GPU вычисления
-            gpu_ranges = []
-            for i in range(len(self.opencl_contexts)):
-                range_end = n + BATCH_SIZE - 1
-                gpu_ranges.append((i, n, range_end))
-                n = range_end + 1
-            
-            # Запуск GPU вычислений
-            for device_idx, start, end in gpu_ranges:
-                try:
-                    primes = self.calculate_primes_gpu(device_idx, start, end)
-                    all_primes.extend(primes)
-                    print(f"GPU {device_idx}: обработан диапазон {start}-{end}, найдено {len(primes)} простых чисел")
-                except Exception as e:
-                    print(f"Ошибка на GPU {device_idx}: {e}")
+            # GPU вычисления в основном потоке
+            gpu_results = []
+            if self.contexts:
+                # Создаем потоки для параллельного выполнения GPU вычислений
+                threads = []
+                for i in range(len(self.contexts)):
+                    range_end = n + GPU_BATCH_SIZE - 1
+                    thread = threading.Thread(
+                        target=lambda idx=i, start=n, end=range_end: 
+                        gpu_results.append((idx, self.calculate_primes_gpu_batch(idx, start, end)))
+                    )
+                    threads.append(thread)
+                    n = range_end + 1
+                
+                # Запускаем все потоки
+                for thread in threads:
+                    thread.start()
+                
+                # Ждем завершения всех потоков
+                for thread in threads:
+                    thread.join()
+                
+                # Собираем результаты
+                for device_idx, primes in gpu_results:
+                    if primes:
+                        all_primes.extend(primes)
             
             # CPU вычисления
             cpu_range_end = n + CPU_BATCH_SIZE - 1
             cpu_primes = self.calculate_primes_cpu_parallel(n, cpu_range_end)
             all_primes.extend(cpu_primes)
-            print(f"CPU: обработан диапазон {n}-{cpu_range_end}, найдено {len(cpu_primes)} простых чисел")
-            
             n = cpu_range_end + 1
             
             # Запись результатов
@@ -210,21 +244,18 @@ class PrimeCalculator:
             # Статистика
             batch_time = time.time() - batch_start_time
             total_time = time.time() - program_start_time
-            total_primes = len(all_primes) if all_primes else 0
             
-            print(f"Батч завершен за {batch_time:.2f}с | "
-                  f"Всего времени: {total_time:.1f}с | "
-                  f"Найдено простых: {total_primes}")
-            
-            # Небольшая пауза для предотвращения перегрева
-            time.sleep(0.1)
+            print(f"БАТЧ: {batch_time:.2f}с | ВСЕГО: {total_time:.1f}с | "
+                  f"ПРОСТЫХ: {len(all_primes)} | ТЕКУЩЕЕ: {n}")
+            print("-" * 80)
 
 def main():
     print("PyOpenCL version:", cl.VERSION_TEXT)
-    print("Platforms:", cl.get_platforms())
-    calculator = PrimeCalculator()
+    print("Platforms:", [f"{p.name} ({p.vendor})" for p in cl.get_platforms()])
+    
+    calculator = OptimizedPrimeCalculator()
     try:
-        calculator.run_distributed_calculation()
+        calculator.run_optimized_calculation()
     except KeyboardInterrupt:
         print("\nВычисление прервано пользователем")
 
